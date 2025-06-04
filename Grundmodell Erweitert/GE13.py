@@ -41,8 +41,16 @@ from direct.task import Task
 from direct.task.TaskManagerGlobal import taskMgr
 from direct.gui.DirectGui import DirectButton, DirectSlider, DirectLabel
 
+from environment_visualization import EnvironmentVisualizer
+
+
 class LagerSimulation(ShowBase):
     def __init__(self, graph_queue=None):
+        # Erstelle das Tkinter-Rootfenster gleich zu Beginn,
+        # bevor irgendwelche Tkinter-Widgets oder -Variablen angelegt werden.
+        self.tk_root = tk.Tk()
+        self.tk_root.withdraw()
+
         # Basisinitialisierung und Simulationsvariablen
         super().__init__()
         self.paused = False
@@ -52,13 +60,13 @@ class LagerSimulation(ShowBase):
         self.state_timer = 0.0
 
         # Kennzahlen (KPIs)
-        self.delivered_packages = 0
         self.max_overall_wait_time = 0.0
         self.total_dwell_time = 0.0
         self.picked_up_count = 0
         self.total_delivery_time = 0.0
         self.total_delivery_count = 0
         self.max_overall_delivery_time = 0.0
+        self.delivered_packages = 0
 
         # Paket- und Auftragsverwaltung
         self.pickup_packages = {}  # {Station: (Paket, Spawn-Zeit, Timer-Node)}
@@ -72,39 +80,64 @@ class LagerSimulation(ShowBase):
         self.orders_queue = []
         self.next_order_id = 1
 
-        # Fenster und UI für Auftragsübersicht
-        self.order_win = None
-        self.order_tree = None
+        # UI: Erstelle für die Auswahl der Annahmestationen Tkinter-BooleanVar-Instanzen.
+        # Dabei wird explizit self.tk_root als Master angegeben.
+        self.spawn_station_vars = {}
+        for i in range(10):
+            self.spawn_station_vars[i] = tk.BooleanVar(self.tk_root, value=False)
 
-        # Graph-Prozess (für interaktive Graphen via PyQt)
+        # Graph-Prozess und zugehörige Queue
         self.graph_process = None
         self.graph_queue = None
 
-        # Tkinter-Grundfenster: Es wird im Hintergrund ausgeführt.
-        self.tk_root = tk.Tk()
-        self.tk_root.withdraw()
+        # Fenster und UI für die Auftragsübersicht (später über Tkinter angezeigt)
+        self.order_win = None
+        self.order_tree = None
 
-        # --- Aufbau der Umgebung ---
-        # Ursprung und Kamera
-        self.draw_origin()
+        # Aufgabe zum periodischen Prüfen/Spawnen von Paketen
+        self.taskMgr.add(self.check_and_spawn_packages, "CheckSpawnPackagesTask")
+        self.package_spawn_delay = 5.0
+        self.package_spawn_distribution = "uniform"
+        self.pickup_offset = Vec3(0.5, -0.5, 0)
+
+        # Umgebung initialisieren
+        self.env = EnvironmentVisualizer(self.render, self.loader)
+        env_config = self.env.setup_environment()
+
+        # Greife auf wichtige Umgebungselemente zu
+        self.origin = env_config["origin"]
+        self.wall_segments = env_config["wall_segments"]
+
+        self.annahme_stations = env_config["annahme_stations"]
+        self.station_blue_dots = env_config["station_blue_dots"]
+        self.annahme_white_lines = env_config["white_lines"]
+        self.annahme_connecting_line = env_config.get("annahme_connecting_line")
+
+        self.abgabe_stations = env_config["abgabe_stations"]
+        self.abgabe_blue_dots = env_config["abgabe_blue_dots"]
+        self.abgabe_white_lines = env_config["abgabe_white_lines"]
+        self.abgabe_extra_blue_dot = env_config["abgabe_extra_blue_dot"]
+        self.abgabe_extra_line = env_config["abgabe_extra_line"]
+        self.abgabe_connection_line = env_config.get("abgabe_connection_line")
+
+        self.blue_line_10_22 = env_config.get("blue_line_10_22")
+
+        self.garagen_stations = env_config["garagen_stations"]
+        self.garagen_parking_points = env_config["garagen_parking_points"]
+        self.garage_connection_line = env_config.get("garage_connection_line")
+
+        self.yellow_station_points = env_config["yellow_station_points"]
+        self.yellow_abgabe_points = env_config["yellow_abgabe_points"]
+        self.yellow_garage_points = env_config["yellow_garage_points"]
+        self.yellow_connection_points = env_config["yellow_connection_points"]
+
+        # Kamera positionieren und ausrichten
         self.cam.setPos(11, -80, 40)
         self.cam.lookAt(11, 30, 0)
 
-        # Licht und Raster
-        self.erzeuge_licht()
-        self.erzeuge_bodenraster(center_extent=70, cell_size=1)
 
-        # Erzeuge Wände und Stations-Objekte (Annahme-, Abgabe-, und Garagenstationen)
-        self.create_wall()
-        self.create_annahme_stations()
-        self.create_abgabe_stations()
-        self.create_garagen_stations()
 
-        # Für jede Annahmestation ein Paket spawnen
-        for station in self.annahme_stations:
-            self.spawn_package_at_station(station)
-
-        # Fahrzeuge in den Garagen erstellen (insgesamt 5 Fahrzeuge)
+        # Fahrzeuge in den Garagen erstellen (z.B. 5 Fahrzeuge)
         self.create_garage_vehicles()
 
         # Zusätzliche Testvariablen
@@ -113,7 +146,6 @@ class LagerSimulation(ShowBase):
         self.current_order = None
 
         # --- UI-Elemente für Simulationssteuerung ---
-        # Slider für Simulationsgeschwindigkeit
         self.speed_slider = DirectSlider(
             range=(0.1, 10.0),
             value=self.speed_factor,
@@ -127,12 +159,18 @@ class LagerSimulation(ShowBase):
             pos=(0, 0, -0.75),
             scale=0.07
         )
-        # Informations-Label (Anzeige von Laufzeit, Kennzahlen etc.)
         self.info_label = DirectLabel(
             text="Laufzeit: 0.0s",
             pos=(1.2, 0, 0.8),
             scale=0.07,
             frameColor=(0, 0, 0, 0)
+        )
+        self.paused = False
+        self.pause_button = DirectButton(
+            text="Pause",
+            command=self.toggle_pause,
+            pos=(-0.5, 0, -0.85),
+            scale=0.07
         )
 
         # --- Tastenzuordnungen ---
@@ -141,20 +179,76 @@ class LagerSimulation(ShowBase):
         self.accept("g", self.open_graph)
         self.accept("a", self.show_order_list)
         self.accept("d", self.deliver_first_order)
-        # Taste "c" öffnet das Fahrzeug-Kontrollfenster
         self.accept("c", self.show_vehicle_control)
-
+        self.label_control_button = DirectButton(
+            text="Label Control",
+            command=self.show_label_control,
+            pos=(1.0, 0, -0.85),
+            scale=0.07
+        )
 
         # --- Tasks (TaskMgr) hinzufügen ---
         self.taskMgr.add(self._tk_update, "tkUpdateTask")
         self.taskMgr.add(self.update_delivery_timers, "UpdateDeliveryTimersTask")
         self.taskMgr.add(self.update_sim_clock, "UpdateSimClock")
         self.taskMgr.add(self.update_info_display, "UpdateInfoDisplayTask")
-        self.taskMgr.add(self.check_and_spawn_packages, "CheckSpawnPackagesTask")
+        self.taskMgr.add(self.update_graph_data, "UpdateGraphDataTask")
         self.taskMgr.add(self.update_package_timers, "UpdatePackageTimersTask")
         self.taskMgr.add(self.update_order_status, "UpdateOrderStatusTask")
 
     # ---------------1. Initialisierung & Simulationssteuerung---------------
+    def show_label_control(self):
+        # Erstelle ein neues Tkinter-Fenster für die Label-Steuerung
+        label_win = tk.Toplevel(self.tk_root)
+        label_win.title("Label-Steuerung")
+
+        # BooleanVars für jeden Labeltyp (Standard: Sichtbar = True)
+        self.show_blue_labels = tk.BooleanVar(value=True)
+        self.show_green_labels = tk.BooleanVar(value=True)
+        self.show_yellow_labels = tk.BooleanVar(value=True)
+
+        # Erstelle Checkbuttons für jeden Typ
+        cb_blue = tk.Checkbutton(
+            label_win,
+            text="Blue Labels anzeigen",
+            variable=self.show_blue_labels,
+            command=lambda: self.toggle_labels("blue", self.show_blue_labels.get())
+        )
+        cb_blue.pack(anchor="w", padx=5, pady=2)
+
+        cb_green = tk.Checkbutton(
+            label_win,
+            text="Green Labels anzeigen",
+            variable=self.show_green_labels,
+            command=lambda: self.toggle_labels("green", self.show_green_labels.get())
+        )
+        cb_green.pack(anchor="w", padx=5, pady=2)
+
+        cb_yellow = tk.Checkbutton(
+            label_win,
+            text="Yellow Labels anzeigen",
+            variable=self.show_yellow_labels,
+            command=lambda: self.toggle_labels("yellow", self.show_yellow_labels.get())
+        )
+        cb_yellow.pack(anchor="w", padx=5, pady=2)
+
+    def toggle_labels(self, label_type, visible):
+        """
+        Sucht alle Punkte, die im NodeManager registriert sind und deren Name
+        mit dem übergebenen label_type beginnt (z. B. "blue", "green", "yellow").
+        Dann wird für jeden dieser Punkte das zugehörige Label (gespeichert als PythonTag "label_node")
+        entweder ein- oder ausgeblendet.
+        """
+        # Iteriere über alle registrierten Nodes im NodeManager
+        for node_name, node in self.env.node_manager.nodes.items():
+            if node_name.startswith(label_type):
+                label_np = node.getPythonTag("label_node")
+                if label_np is not None:
+                    if visible:
+                        label_np.show()
+                    else:
+                        label_np.hide()
+
     def update_sim_clock(self, task):
         dt = ClockObject.getGlobalClock().getDt() * self.speed_factor
         self.sim_clock += dt
@@ -344,7 +438,7 @@ class LagerSimulation(ShowBase):
         avg_dwell = self.total_dwell_time / self.picked_up_count if self.picked_up_count > 0 else 0.0
         ppm = self.delivered_packages / (self.sim_clock / 60) if self.sim_clock > 0 else 0
 
-        # Lieferzeit-Kennzahlen ermitteln: für Fahrzeuge, die aktuell ein Paket tragen
+        # Berechne aktuelle Lieferzeiten für Fahrzeuge, die ein Paket tragen
         current_delivery_time = 0.0
         for veh in self.garage_vehicles:
             if veh.getPythonTag("package_attached"):
@@ -354,7 +448,6 @@ class LagerSimulation(ShowBase):
                     current_delivery_time = max(current_delivery_time, elapsed_delivery)
         avg_delivery_time = self.total_delivery_time / self.total_delivery_count if self.total_delivery_count > 0 else 0.0
 
-        # Aktualisiere den Info-Label-Text
         self.info_label['text'] = (
             f"Laufzeit: {formatted}\n"
             f"Abgegebene Pakete: {self.delivered_packages}\n"
@@ -366,7 +459,7 @@ class LagerSimulation(ShowBase):
             f"Lieferzeit (maximal): {self.max_overall_delivery_time:.1f}s\n"
             f"Durchschn. Lieferzeit: {avg_delivery_time:.1f}s"
         )
-        return Task.cont
+        return task.cont
 
     def update_graph_task(self, task):
         times = [data[0] for data in self.graph_data]
@@ -394,6 +487,26 @@ class LagerSimulation(ShowBase):
     def on_graph_close(self, event):
         self.graph_opened = False
         self.taskMgr.remove("UpdateGraphTask")
+
+    def update_graph_data(self, task):
+        if self.sim_clock > 0:
+            ppm = self.delivered_packages / (self.sim_clock / 60)
+        else:
+            ppm = 0.0
+        avg_dwell = self.total_dwell_time / self.picked_up_count if self.picked_up_count > 0 else 0.0
+        avg_delivery = self.total_delivery_time / self.total_delivery_count if self.total_delivery_count > 0 else 0.0
+
+        new_data = (self.sim_clock, ppm, avg_dwell, avg_delivery)
+        # Speichere alle Daten ab Simulationsbeginn:
+        self.graph_data.append(new_data)
+
+        # Zusätzlich: Falls der Graphprozess aktiv ist, schicke den neuen Datensatz auch an die Queue
+        if self.graph_queue is not None:
+            try:
+                self.graph_queue.put(new_data, block=False)
+            except Exception:
+                pass
+        return Task.cont
 
     def show_order_list(self):
         if self.order_win is None:
@@ -514,96 +627,6 @@ class LagerSimulation(ShowBase):
         return Task.cont
 
     # ---------------3. Umgebungsaufbau & Visualisierungsaufbau---------------
-    def draw_origin(self):
-        ls = LineSegs()
-        ls.setThickness(2)
-        ls.setColor(LColor(1, 0, 0, 1))
-        ls.moveTo(0, 0, 0)
-        ls.drawTo(1, 0, 0)
-        ls.setColor(LColor(0, 1, 0, 1))
-        ls.moveTo(0, 0, 0)
-        ls.drawTo(0, 1, 0)
-        ls.setColor(LColor(0, 0, 1, 1))
-        ls.moveTo(0, 0, 0)
-        ls.drawTo(0, 0, 1)
-        self.render.attachNewNode(ls.create())
-
-    def erzeuge_licht(self):
-        alight = AmbientLight("ambient_light")
-        alight.setColor((0.5, 0.5, 0.5, 1))
-        alight_np = self.render.attachNewNode(alight)
-        self.render.setLight(alight_np)
-        dlight = DirectionalLight("directional_light")
-        dlight.setColor((1, 1, 1, 1))
-        dlight_np = self.render.attachNewNode(dlight)
-        dlight_np.setPos(10, -10, 10)
-        self.render.setLight(dlight_np)
-
-    def erzeuge_bodenraster(self, center_extent=70, cell_size=1):
-        vertex_format = GeomVertexFormat.getV3()
-        vdata = GeomVertexData("grid", vertex_format, Geom.UHStatic)
-        writer = GeomVertexWriter(vdata, "vertex")
-        lines = GeomLines(Geom.UHStatic)
-        n_vertices = 0
-        min_line = -center_extent - 0.5
-        max_line = center_extent + 0.5
-        y = min_line
-        while y <= max_line:
-            writer.addData3f(min_line, y, 0)
-            writer.addData3f(max_line, y, 0)
-            lines.addVertices(n_vertices, n_vertices + 1)
-            n_vertices += 2
-            y += cell_size
-        x = min_line
-        while x <= max_line:
-            writer.addData3f(x, min_line, 0)
-            writer.addData3f(x, max_line, 0)
-            lines.addVertices(n_vertices, n_vertices + 1)
-            n_vertices += 2
-            x += cell_size
-        lines.closePrimitive()
-        geom = Geom(vdata)
-        geom.addPrimitive(lines)
-        node = GeomNode("grid")
-        node.addGeom(geom)
-        np_grid = self.render.attachNewNode(node)
-        np_grid.setColor(LColor(0.7, 0.7, 0.7, 1))
-        return np_grid
-
-    def create_wall(self):
-        p1 = Vec3(0, 0, 0)
-        p2 = Vec3(0, 60, 0)
-        p3 = Vec3(22, 60, 0)
-        p4 = Vec3(22, 0, 0)
-        self.add_wall_segment(p1, p2)
-        self.add_wall_segment(p2, p3)
-        self.add_wall_segment(p3, p4)
-        self.add_wall_segment(p4, p1)
-
-    def add_wall_segment(self, start, end, height=2.0, thickness=0.5):
-        seg_vector = end - start
-        length = seg_vector.length()
-        if length == 0:
-            return
-        d = seg_vector.normalized()
-        outward = Vec3(-d.getY(), d.getX(), 0)
-        center = (start + end) * 0.5 + outward * (thickness / 2.0)
-        center.setZ(height / 2.0)
-        angle = math.degrees(math.atan2(seg_vector.getY(), seg_vector.getX()))
-        wall_np = self.render.attachNewNode("wall_np")
-        wall = self.loader.loadModel("models/box")
-        bounds = wall.getTightBounds()
-        if bounds:
-            low, high = bounds
-            box_center = (low + high) * 0.5
-            wall.setPos(-box_center)
-        wall.reparentTo(wall_np)
-        wall_np.setScale(length, thickness, height)
-        wall_np.setPos(center)
-        wall_np.setH(angle)
-        wall_np.setTextureOff(1)
-        wall_np.setColor(LColor(0.5, 0.5, 0.5, 1))
-
     def update_cable(self, task):
         # Verwende die simulative Zeit, die bereits in update_sim_clock hochgezählt wird
         t = self.sim_clock
@@ -611,360 +634,62 @@ class LagerSimulation(ShowBase):
         self.fork_node.setZ(new_height)
         return Task.cont
 
-    # ---------------4. Erstellung der Stationen---------------
-    def create_annahme_station(self, pos):
-        ls = LineSegs()
-        ls.setThickness(2.0)
-        ls.setColor(LColor(0, 1, 0, 1))
-        v0 = pos + Vec3(0, 0, 0)
-        v1 = pos + Vec3(1, 0, 0)
-        v2 = pos + Vec3(1, 1, 0)
-        v3 = pos + Vec3(0, 1, 0)
-        v4 = pos + Vec3(0, 0, 1)
-        v5 = pos + Vec3(1, 0, 1)
-        v6 = pos + Vec3(1, 1, 1)
-        v7 = pos + Vec3(0, 1, 1)
-        ls.moveTo(v0)
-        ls.drawTo(v1)
-        ls.moveTo(v2)
-        ls.drawTo(v3)
-        ls.moveTo(v3)
-        ls.drawTo(v0)
-        ls.moveTo(v4)
-        ls.drawTo(v5)
-        ls.moveTo(v6)
-        ls.drawTo(v7)
-        ls.moveTo(v7)
-        ls.drawTo(v4)
-        ls.moveTo(v0)
-        ls.drawTo(v4)
-        ls.moveTo(v3)
-        ls.drawTo(v7)
-        return self.render.attachNewNode(ls.create())
-
-    def create_annahme_stations(self):
-        """
-        Erzeugt die Annahmestationen und erstellt für jede Station:
-          - Einen weißen Marker zur Orientierung
-          - Einen grünen Punkt (optional)
-          - Eine weiße Linie, an deren Endpunkt ein blauer Marker als Ziel in der "Translate‑Phase" dient
-
-        Zusätzlich wird ein Dictionary self.station_blue_dots aufgebaut, in dem jedem Annahmestations‑Node
-        der zugehörige blaue Marker zugeordnet wird. Außerdem wird für die erste Station die globale Variable
-        self.station_white_direction festgelegt.
-        """
-        station_points = [
-            Vec3(0, 5, 0), Vec3(0, 10, 0), Vec3(0, 15, 0),
-            Vec3(0, 20, 0), Vec3(0, 25, 0), Vec3(0, 30, 0),
-            Vec3(0, 35, 0), Vec3(0, 40, 0), Vec3(0, 45, 0),
-            Vec3(0, 50, 0)
-        ]
-        self.annahme_stations = []
-        self.station_blue_dots = {}
-
-        for i, pt in enumerate(station_points, start=1):
-            # Erstelle die Basisstation (zum Beispiel als Rahmen)
-            self.create_annahme_station(pt)
-            station_dummy = self.render.attachNewNode(f"annahme_station_{i}")
-            station_dummy.setPos(pt)
-            self.annahme_stations.append(station_dummy)
-
-            # Berechne den Mittelpunkt der Station
-            center = pt + Vec3(0.5, 0.5, 0.5)
-
-            # Erzeuge den weißen Marker als Orientierung
-            marker = self.loader.loadModel("models/misc/sphere")
-            marker.setScale(0.15)
-            marker.setColor(LColor(1, 1, 1, 1))
-            marker.setPos(center)
-            marker.reparentTo(self.render)
-
-            # Erzeuge den grünen Punkt (optional)
-            green_dot = self.loader.loadModel("models/misc/sphere")
-            green_dot.setScale(0.1)
-            green_dot.setColor(LColor(0, 1, 0, 1))
-            green_dot.setPos(center + Vec3(0, 0, -0.5))
-            green_dot.reparentTo(self.render)
-
-            # Zeichne die weiße Linie: Sie beginnt bei center + Vec3(0, 0, -0.5) und verläuft 3 Meter in X‑Richtung.
-            line_seg = LineSegs()
-            line_seg.setThickness(2.0)
-            line_seg.setColor(LColor(1, 1, 1, 1))
-            start_line = center + Vec3(0, 0, -0.5)
-            end_line = start_line + Vec3(3, 0, 0)
-            line_seg.moveTo(start_line)
-            line_seg.drawTo(end_line)
-            self.render.attachNewNode(line_seg.create())
-
-            # Erzeuge den blauen Marker, der als Ziel in der Translate‑Phase dient
-            blue_dot = self.loader.loadModel("models/misc/sphere")
-            blue_dot.setScale(0.1)
-            blue_dot.setColor(LColor(0, 0, 1, 1))
-            blue_dot.setPos(end_line)
-            blue_dot.reparentTo(self.render)
-
-            # Speichere den blauen Marker im Dictionary, sodass er später erzeugt werden kann
-            self.station_blue_dots[station_dummy] = blue_dot
-
-            # Optionale Textanzeige der Stationsnummer
-            tn = TextNode("station_number")
-            tn.setText(str(i))
-            tn.setAlign(TextNode.ACenter)
-            tn.setTextColor(LColor(0, 0, 0, 1))
-            tn_np = self.render.attachNewNode(tn)
-            tn_np.setPos(pt.x + 1.1, pt.y + 0.5, 0.01)
-            tn_np.setHpr(0, -90, 0)
-
-            # Zusätzliche Markierungen (Kreuze) – falls benötigt:
-            v0 = pt + Vec3(0, 0, 0)
-            v1 = pt + Vec3(1, 0, 0)
-            v2 = pt + Vec3(1, 1, 0)
-            v3 = pt + Vec3(0, 1, 0)
-            v4 = pt + Vec3(0, 0, 1)
-            v5 = pt + Vec3(1, 0, 1)
-            v6 = pt + Vec3(1, 1, 1)
-            v7 = pt + Vec3(0, 1, 1)
-            self.add_cross_on_face([v0, v3, v7, v4], color=LColor(0, 1, 0, 1))
-            self.add_cross_on_face([v0, v1, v5, v4], color=LColor(0, 1, 0, 1))
-            self.add_cross_on_face([v3, v2, v6, v7], color=LColor(0, 1, 0, 1))
-
-            # Für die erste Station (oder den ersten relevanten Pickup) setzen wir globale Referenzen,
-            # die in vehicle_order_task benötigt werden.
-            if i == 1:
-                self.blue_dot = blue_dot
-                self.station_green_dot = green_dot
-                # Berechne den Mittelpunkt der weißen Linie als Referenz (optional)
-                self.white_line_center = (start_line + end_line) * 0.5
-                line_vec = end_line - start_line
-                if line_vec.length() != 0:
-                    self.station_white_direction = Vec2(line_vec.getX(), line_vec.getY()).normalized()
-                else:
-                    self.station_white_direction = Vec2(1, 0)  # Fallback-Wert
-
-    def create_abgabe_station(self, pos):
-        ls = LineSegs()
-        ls.setThickness(2.0)
-        ls.setColor(LColor(1, 0, 0, 1))
-        v0 = pos + Vec3(0, 0, 0)
-        v1 = pos + Vec3(1, 0, 0)
-        v2 = pos + Vec3(1, 1, 0)
-        v3 = pos + Vec3(0, 1, 0)
-        v4 = pos + Vec3(0, 0, 1)
-        v5 = pos + Vec3(1, 0, 1)
-        v6 = pos + Vec3(1, 1, 1)
-        v7 = pos + Vec3(0, 1, 1)
-        ls.moveTo(v0)
-        ls.drawTo(v1)
-        ls.moveTo(v1)
-        ls.drawTo(v2)
-        ls.moveTo(v2)
-        ls.drawTo(v3)
-        ls.moveTo(v4)
-        ls.drawTo(v5)
-        ls.moveTo(v5)
-        ls.drawTo(v6)
-        ls.moveTo(v6)
-        ls.drawTo(v7)
-        ls.moveTo(v1)
-        ls.drawTo(v5)
-        ls.moveTo(v2)
-        ls.drawTo(v6)
-        return self.render.attachNewNode(ls.create())
-
-    def create_abgabe_stations(self):
-        station_points = [
-            Vec3(21, 5, 0), Vec3(21, 10, 0), Vec3(21, 15, 0),
-            Vec3(21, 20, 0), Vec3(21, 25, 0), Vec3(21, 30, 0),
-            Vec3(21, 35, 0), Vec3(21, 40, 0), Vec3(21, 45, 0),
-            Vec3(21, 50, 0)
-        ]
-        self.abgabe_stations = []  # Liste der Abgabestationen
-        self.abgabe_blue_dots = []  # Liste zum Speichern der blauen Marker für die Abgabe
-
-        for i, pt in enumerate(station_points, start=1):
-            # Erstelle die Basiskonstruktion der Abgabestation
-            node = self.create_abgabe_station(pt)
-            self.abgabe_stations.append(node)
-
-            # Berechne den Mittelpunkt der Station
-            center = pt + Vec3(0.5, 0.5, 0.5)
-
-            # Marker am Zentrum (weiß)
-            marker = self.loader.loadModel("models/misc/sphere")
-            marker.setScale(0.15)
-            marker.setColor(LColor(1, 1, 1, 1))
-            marker.setPos(center)
-            marker.reparentTo(self.render)
-
-            # Grüner Punkt: center + Vec3(0, 0, -0.5)
-            green_dot = self.loader.loadModel("models/misc/sphere")
-            green_dot.setScale(0.1)
-            green_dot.setColor(LColor(0, 1, 0, 1))
-            green_dot.setPos(center + Vec3(0, 0, -0.5))
-            green_dot.reparentTo(self.render)
-
-            # Weiße Linie: Startet bei center + Vec3(0, 0, -0.5)
-            # und verläuft 3 Meter in negativer X-Richtung
-            line_seg = LineSegs()
-            line_seg.setThickness(2.0)
-            line_seg.setColor(LColor(1, 1, 1, 1))
-            start_line = center + Vec3(0, 0, -0.5)
-            end_line = start_line + Vec3(-3, 0, 0)
-            line_seg.moveTo(start_line)
-            line_seg.drawTo(end_line)
-            self.render.attachNewNode(line_seg.create())
-
-            # Blauer Punkt: wird an der Endposition der Linie erzeugt
-            blue_dot = self.loader.loadModel("models/misc/sphere")
-            blue_dot.setScale(0.1)
-            blue_dot.setColor(LColor(0, 0, 1, 1))
-            blue_dot.setPos(end_line)
-            blue_dot.reparentTo(self.render)
-            # Speichere den blauen Marker für spätere Navigation der Abgabestation
-            self.abgabe_blue_dots.append(blue_dot)
-
-            # Anzeige der Stationsnummer (textuell)
-            tn = TextNode("station_number")
-            tn.setText(str(i))
-            tn.setAlign(TextNode.ACenter)
-            tn.setTextColor(LColor(0, 0, 0, 1))
-            tn_np = self.render.attachNewNode(tn)
-            tn_np.setPos(pt.x - 0.1, pt.y + 0.5, 0.01)
-            tn_np.setHpr(0, -90, 0)
-
-            # Zusätzliche Markierungen (Kreuze) auf der Station
-            v0 = pt + Vec3(0, 0, 0)
-            v1 = pt + Vec3(1, 0, 0)
-            v2 = pt + Vec3(1, 1, 0)
-            v3 = pt + Vec3(0, 1, 0)
-            v4 = pt + Vec3(0, 0, 1)
-            v5 = pt + Vec3(1, 0, 1)
-            v6 = pt + Vec3(1, 1, 1)
-            v7 = pt + Vec3(0, 1, 1)
-            self.add_cross_on_face([v1, v2, v6, v5], color=LColor(1, 0, 0, 1))
-            self.add_cross_on_face([v0, v1, v5, v4], color=LColor(1, 0, 0, 1))
-            self.add_cross_on_face([v3, v2, v6, v7], color=LColor(1, 0, 0, 1))
-
-    def create_garage_station(self, pos):
-        ls = LineSegs()
-        ls.setThickness(2.0)
-        ls.setColor(LColor(0, 0, 1, 1))
-        v0 = pos + Vec3(0, 0, 0)
-        v1 = pos + Vec3(1, 0, 0)
-        v2 = pos + Vec3(1, 2, 0)
-        v3 = pos + Vec3(0, 2, 0)
-        v4 = pos + Vec3(0, 0, 3)
-        v5 = pos + Vec3(1, 0, 3)
-        v6 = pos + Vec3(1, 2, 3)
-        v7 = pos + Vec3(0, 2, 3)
-        edges = [
-            (v0, v1), (v1, v2), (v2, v3), (v3, v0),
-            (v4, v5), (v5, v6), (v6, v7), (v7, v4),
-            (v0, v4), (v1, v5), (v2, v6), (v3, v7)
-        ]
-        for p, q in edges:
-            if p.getY() == pos.getY() and q.getY() == pos.getY():
-                continue
-            ls.moveTo(p)
-            ls.drawTo(q)
-        node = self.render.attachNewNode(ls.create())
-        self.add_cross_on_face([v3, v2, v6, v7], color=LColor(0, 0, 1, 1))
-        self.add_cross_on_face([v0, v3, v7, v4], color=LColor(0, 0, 1, 1))
-        self.add_cross_on_face([v1, v2, v6, v5], color=LColor(0, 0, 1, 1))
-        return node
-
-    def add_garage_roof(self, pos):
-        cm = CardMaker("garage_roof")
-        cm.setFrame(0, 1, 0, 2)
-        roof = self.render.attachNewNode(cm.generate())
-        roof.setHpr(0, -90, 0)
-        roof.setPos(pos.x, pos.y, pos.z + 3)
-        roof.setColor(LColor(0, 0, 1, 1))
-        return roof
-
-    def create_garagen_stations(self):
-        station_points = [
-            Vec3(3, 58, 0), Vec3(7, 58, 0), Vec3(11, 58, 0),
-            Vec3(15, 58, 0), Vec3(19, 58, 0)
-        ]
-        self.garagen_stations = []
-        self.garagen_parking_points = []
-        for i, pt in enumerate(station_points, start=1):
-            self.create_garage_station(pt)
-            self.add_garage_roof(pt)
-            self.garagen_stations.append(pt)
-            # ParkpunktGarage: Verschoben um 0.5 in negativer Y-Richtung:
-            center = pt + Vec3(0.5, 0.5, 1.5)
-            ParkpunktGarage = center + Vec3(0, 0, 0.7)
-            self.garagen_parking_points.append(ParkpunktGarage)
-            tn = TextNode("garage_number")
-            tn.setText(str(i))
-            tn.setAlign(TextNode.ACenter)
-            tn.setTextColor(LColor(0, 0, 0, 1))
-            tn_np = self.render.attachNewNode(tn)
-            tn_np.setPos(pt.x + 0.5, pt.y - 0.5, 0.01)
-            tn_np.setHpr(0, -90, 0)
-
     def create_garage_vehicles(self):
+        # Stelle sicher, dass self.garagen_parking_points bereits gesetzt wurde
         self.garage_vehicles = []
         vehicle_id_counter = 1
         for park in self.garagen_parking_points:
+            # Erzeuge Fahrzeug – hierbei wird davon ausgegangen, dass die Methode create_vehicle existiert.
             veh = self.create_vehicle(park_point=park)
             veh.setH(veh.getH() + 180)
             intersection = Vec3(0.5, 0.05, 1.0)
-            newPos = park - veh.getQuat().xform(intersection)
+            newPos = park.getPos() - veh.getQuat().xform(intersection)
+
             newPos.setZ(0)
             veh.setPos(newPos)
-
-            # Fahrzeuge starten im Standby (idle)
+            # Setze Fahrzeug-Tags
             veh.setPythonTag("current_order", None)
             veh.setPythonTag("order_state", "idle")
             veh.setPythonTag("package_attached", False)
             veh.setPythonTag("vehicle_id", vehicle_id_counter)
-            # Speichere den Parkpunkt als Rückkehrziel
             veh.setPythonTag("garage_target", park)
-            # Speichere auch das Anfangs-Heading, um es später beim Parken wiederherzustellen.
             veh.setPythonTag("start_heading", veh.getH())
             vehicle_id_counter += 1
-
             self.garage_vehicles.append(veh)
 
-            marker = self.loader.loadModel("models/misc/sphere")
-            marker.setScale(0.2)
-            marker.setColor(LColor(0, 0, 1, 1))
-            marker.setPos(park.getX(), park.getY(), 0)
-            marker.reparentTo(self.render)
+            # Markierung für das Fahrzeug (z.B. als Standort in der Garage)
+            # Müssen als Green Nodes in den Node Manager.
+            # marker = self.loader.loadModel("models/misc/sphere")
+            # marker.setScale(0.2)
+            # marker.setColor(LColor(0, 0, 1, 1))
+            # marker.setPos(park.getX(), park.getY(), 0)
+            # marker.reparentTo(self.render)
 
-            # Füge einen Textknoten hinzu, der die Fahrzeugnummer vorne auf dem Fahrzeug anzeigt.
-            # Wir suchen den Mast-Knoten.
+            # Fahrzeugnummer als Text – Suche nach Mast oder hänge direkt an das Fahrzeug
             mast = veh.find("**/mast")
             if not mast.isEmpty():
-                from panda3d.core import TextNode
                 tn = TextNode("vehicle_number")
                 tn.setText(str(veh.getPythonTag("vehicle_id")))
-                tn.setTextColor(0, 0, 0, 1)  # Schwarz
+                tn.setTextColor(LColor(0, 0, 0, 1))
                 tn.setAlign(TextNode.ACenter)
                 text_np = mast.attachNewNode(tn)
-                # Positioniere den Text relativ zum Mast: Wir nutzen den Vektor "intersection"
-                # und versetzen ihn in Z-Richtung um 0.2 Einheiten oberhalb des Zylinders.
                 text_np.setPos(intersection.x, intersection.y, intersection.z + 0.2)
                 text_np.setScale(0.8)
                 text_np.setHpr(0, 0, 0)
             else:
-                from panda3d.core import TextNode
                 tn = TextNode("vehicle_number")
                 tn.setText(str(veh.getPythonTag("vehicle_id")))
-                tn.setTextColor(0, 0, 0, 1)
+                tn.setTextColor(LColor(0, 0, 0, 1))
                 tn.setAlign(TextNode.ACenter)
                 text_np = veh.attachNewNode(tn)
                 text_np.setPos(0, 1.2, 1.5)
                 text_np.setScale(0.8)
                 text_np.setHpr(0, 0, 0)
-
+            # Starte den Fahrzeugtask (sofern diese Logik besteht)
             self.taskMgr.add(partial(self.vehicle_order_task, veh),
                              f"VehicleOrderTask_{veh.getPythonTag('vehicle_id')}")
 
-    # ---------------5. Fahrzeug-Erstellung & Geometrie---------------
+    # --------------- Erstellung des Fahrzeugs---------------
     def create_vehicle(self, park_point=None):
         # Erzeuge den übergeordneten Fahrzeug-Knoten
         vehicle_node = self.render.attachNewNode("vehicle")
@@ -984,6 +709,8 @@ class LagerSimulation(ShowBase):
         # --------------------------
         fork_node = vehicle_node.attachNewNode("fork")
         fork_node.setPos(0, -1.2, 0)
+        vehicle_node.setPythonTag("fork_node", fork_node)
+
         left_tooth = self.create_box(0.2, 1.2, 0.1, (0.3, 0.3, 0.3, 1))
         node_left = fork_node.attachNewNode(left_tooth)
         node_left.setTwoSided(True)
@@ -992,36 +719,48 @@ class LagerSimulation(ShowBase):
         node_right.setTwoSided(True)
         node_right.setPos(0.8, 0, 0)
 
-        # Speichere den Gabel-Knoten als Python-Tag am Fahrzeug
-        vehicle_node.setPythonTag("fork_node", fork_node)
-
         # --------------------------
-        # Erzeuge den grünen Referenzmarker (für die Gabel)
-        # --------------------------
-        ls_new = LineSegs()
-        ls_new.setThickness(2.0)
-        ls_new.setColor(1, 1, 1, 1)
+        # Statt weißer Kante von der Gabel: bereits eingezeichnete grüne Mittellinie verwenden.
+        # In diesem Beispiel nehmen wir an, dass du schon eine „mittlere“ Linie gezeichnet hast.
+        # Zeichne die grüne Mittellinie, z. B. von einem Punkt an der Gabel (als Ausgangspunkt)
+        # bis zu einem Referenzpunkt – hier nutzen wir einen zuvor festgelegten Offset.
+        #
+        # Wir definieren:
+        #   - Den Ausgangspunkt als den grün markierten Punkt, der den mittleren Punkt der Gabel repräsentieren soll.
+        #   - Den Zielpunkt als den Referenzpunkt, der als Idealwert in create_vehicle bestimmt wurde.
+        # In unserem Beispiel berechnen wir den Zielpunkt einmalig aus den lokalen Offsets an der weißen Kante.
+        # (Diese Werte kannst du bei Bedarf anpassen.)
         left_corner_local = Vec3(0, 0, 0.05)
         right_corner_local = Vec3(1.0, 0, 0.05)
-        left_corner_global = fork_node.getPos() + left_corner_local
-        right_corner_global = fork_node.getPos() + right_corner_local
-        ls_new.moveTo(left_corner_global)
-        ls_new.drawTo(right_corner_global)
-        vehicle_node.attachNewNode(ls_new.create())
-        midpoint = (left_corner_global + right_corner_global) * 0.5
-        white_line_vec = right_corner_global - left_corner_global
-        white_line_dir = white_line_vec.normalized() if white_line_vec.length() != 0 else Vec3(0, 0, 0)
-        candidate = Vec3(-white_line_dir.getY(), white_line_dir.getX(), 0)
-        perp_direction = candidate.normalized() if candidate.length() != 0 else Vec3(0, 0, 0)
-        green_point_global = midpoint + perp_direction * 0.5
-
+        left_global = fork_node.getPos(self.render) + left_corner_local
+        right_global = fork_node.getPos(self.render) + right_corner_local
+        # Berechne den idealen (statischen) Mittelpunkt als Referenz – dieser wird nur einmal gesetzt.
+        midpoint_white = (left_global + right_global) * 0.5
+        # Nun lege den grünen Marker so, dass er exakt in der Mitte der Gabel liegt.
+        # Hier entspricht der grüne Punkt der Mittellinie der Gabel.
+        green_point_global = midpoint_white  # Hier wird angenommen, dass der ideale Mittelpunkt gleich dem Referenzpunkt ist.
         green_marker = self.create_box(0.05, 0.05, 0.05, (0, 1, 0, 1))
         green_marker_np = vehicle_node.attachNewNode(green_marker)
         green_marker_np.setPos(green_point_global - Vec3(0.025, 0.025, 0.025))
         vehicle_node.setPythonTag("fork_green", green_marker_np)
 
+        # Zeichne die grüne Mittellinie.
+        # Als Beispiel: Zeichne eine Linie vom grünen Marker in Richtung +Y (relativ zum Fahrzeug),
+        # weil du den idealen Zustand so festgelegt hast, dass genau diese Linie mit der Station übereinstimmen soll.
+        ls_mid = LineSegs()
+        ls_mid.setThickness(2.0)
+        ls_mid.setColor(0, 1, 0, 1)  # grün
+        # Starte die Linie am grünen Marker.
+        ls_mid.moveTo(green_point_global)
+        # Zeichne beispielsweise eine Linie 1 Einheit lang in +Y-Richtung:
+        ls_mid.drawTo(green_point_global + Vec3(0, 1, 0))
+        fork_center_line = vehicle_node.attachNewNode(ls_mid.create())
+        # Speichere den NodePath der grünen Mittellinie
+        vehicle_node.setPythonTag("fork_center_line", fork_center_line)
+        print("[DEBUG] create_vehicle: Grüne Mittellinie (fork_center_line) gesetzt.")
+
         # --------------------------
-        # Mast und weitere Fahrzeugteile
+        # Restliche Fahrzeugteile (Mast, Lenkachse, etc.)
         # --------------------------
         mast_node = vehicle_node.attachNewNode("mast")
         mast_node.setPos(0, 0.2, 1.2)
@@ -1041,35 +780,79 @@ class LagerSimulation(ShowBase):
         mast_node.setPos(0, 0.2, 1.2)
         self.add_diagonals_to_mast(mast_node)
 
-        # Setze einen Schnittpunkt (Intersection) – dieser wird als Referenz genutzt.
         intersection = Vec3(0.5, 0.05, 1.0)
+        cylinder_node = NodePath(self.create_cylinder(0.1, 0.1, 16, (1, 1, 0, 1)))
+        cylinder_node.reparentTo(mast_node)
+        cylinder_node.setPos(intersection)
 
         # --------------------------
-        # Lenkachse erzeugen:
-        # Anstatt den Zylinder direkt bei (0.5, 0.05, 1.0) anzubringen,
-        # erstellen wir einen Pivot-Knoten (steering_axis) mit Z=0.
+        # Lenkachse erzeugen (Pivot-Node)
         # --------------------------
         steering_axis = mast_node.attachNewNode("steering_axis")
-        steering_axis.setPos(0.5, 0.05, -1.2)  # Global: 1.2 + (-1.2) = 0
+        steering_axis.setPos(0.5, 0.25, -1.2)
         steering_axis.setH(90)
         vehicle_node.setPythonTag("steering_axis", steering_axis)
 
-        # Erzeuge den Zylinder, der die Lenkachse (auch als visuelles Element) darstellt
         cylinder_node = NodePath(self.create_cylinder(0.1, 0.1, 16, (1, 1, 0, 1)))
         cylinder_node.reparentTo(steering_axis)
         cylinder_node.setPos(0, 0, 0)
         self.vehicle_cylinder = steering_axis
-
-        # Hier fügen wir den Pfeil an der Lenkachse hinzu – er soll immer in die vorwärtsgerichtete (lokale X-) Richtung zeigen.
         self.add_steering_arrow(steering_axis, color=(0, 1, 0, 1))
+
         # --------------------------
-        # Fahrzeugpositionierung am Parkpunkt
+        # Positioniere das Fahrzeug am Parkpunkt
         # --------------------------
         if park_point is None:
             vehicle_node.setPos(0, 0, 0)
         else:
-            intersection = Vec3(0.5, 0.05, 1.0)
-            vehicle_node.setPos(park_point - vehicle_node.getQuat().xform(intersection))
+            intersection = Vec3(0, 0, 1.0)
+            vehicle_node.setPos(park_point.getPos() - vehicle_node.getQuat().xform(intersection))
+
+
+        # ********** Ursprung (Koordinatensystem) am Fahrzeug einzeichnen **********
+        ls_x = LineSegs()
+        ls_x.setThickness(2)
+        ls_x.setColor(LColor(1, 0, 0, 1))
+        ls_x.moveTo(0, 0, 0)
+        ls_x.drawTo(1, 0, 0)
+        vehicle_node.attachNewNode(ls_x.create())
+
+        ls_y = LineSegs()
+        ls_y.setThickness(2)
+        ls_y.setColor(LColor(0, 1, 0, 1))
+        ls_y.moveTo(0, 0, 0)
+        ls_y.drawTo(0, 1, 0)
+        vehicle_node.attachNewNode(ls_y.create())
+
+        ls_z = LineSegs()
+        ls_z.setThickness(2)
+        ls_z.setColor(LColor(0, 0, 1, 1))
+        ls_z.moveTo(0, 0, 0)
+        ls_z.drawTo(0, 0, 1)
+        vehicle_node.attachNewNode(ls_z.create())
+
+        from panda3d.core import TextNode
+        tn_x = TextNode("label_x")
+        tn_x.setText("X")
+        tn_x.setTextColor(1, 0, 0, 1)
+        label_x = vehicle_node.attachNewNode(tn_x)
+        label_x.setScale(0.3)
+        label_x.setPos(2.0, 0, 0)
+
+        tn_y = TextNode("label_y")
+        tn_y.setText("Y")
+        tn_y.setTextColor(0, 1, 0, 1)
+        label_y = vehicle_node.attachNewNode(tn_y)
+        label_y.setScale(0.3)
+        label_y.setPos(0, 2.0, 0)
+
+        tn_z = TextNode("label_z")
+        tn_z.setText("Z")
+        tn_z.setTextColor(0, 0, 1, 1)
+        label_z = vehicle_node.attachNewNode(tn_z)
+        label_z.setScale(0.3)
+        label_z.setPos(0, 0, 2.0)
+
         return vehicle_node
 
     def add_steering_arrow(self, steering_axis, color=(0, 1, 0, 1)):
@@ -1198,6 +981,7 @@ class LagerSimulation(ShowBase):
         node.addGeom(geom)
         return node
 
+
     def create_box(self, width, depth, height, color):
         fmt = GeomVertexFormat.getV3n3cp()
         vdata = GeomVertexData("box", fmt, Geom.UHStatic)
@@ -1268,28 +1052,6 @@ class LagerSimulation(ShowBase):
         ls.drawTo(0, depth, height)
         return NodePath(ls.create())
 
-    def add_cross_on_face(self, corners, color=LColor(1, 1, 1, 1), thickness=1.5):
-        """
-        Zeichnet ein Kreuz (zwei diagonale Linien) auf der Fläche,
-        definiert durch die vier Ecken in 'corners'.
-
-        Parameters:
-          corners (list of Vec3): Liste aus vier Eckpunkten der Fläche.
-          color (LColor): Farbe des Kreuzes.
-          thickness (float): Linienstärke.
-
-        Returns:
-          NodePath: Das NodePath-Objekt, welches die gezeichneten Linien beinhaltet.
-        """
-        ls = LineSegs()
-        ls.setThickness(thickness)
-        ls.setColor(color)
-        ls.moveTo(corners[0])
-        ls.drawTo(corners[2])
-        ls.moveTo(corners[1])
-        ls.drawTo(corners[3])
-        return self.render.attachNewNode(ls.create())
-
     # ---------------6. Paket- & Auftragsverwaltung---------------
     def spawn_package_at_station(self, station):
         pos = station.getPos(self.render)
@@ -1305,13 +1067,11 @@ class LagerSimulation(ShowBase):
         self.pickup_packages[station] = (package, spawn_time, timer_np)
         self.last_removed[station] = self.sim_clock
 
-        # Bestimme zufällig eine Abgabestation als Ziel
-        if hasattr(self, "abgabe_stations") and self.abgabe_stations:
-            target_index = random.randint(1, len(self.abgabe_stations))
-        else:
-            target_index = 1
+        # Je nach gewählter Verteilung kannst du hier Anpassungen vornehmen.
+        # Für den Moment wählen wir einfach zufällig aus allen Abgabestationen,
+        # falls keine spezielle Logik für die Verteilung implementiert ist.
+        target_index = random.randint(1, len(self.abgabe_stations))
 
-        # Erstelle den Auftrag zur Annahmestation
         order = {
             "id": self.next_order_id,
             "status": "Wartend",
@@ -1325,8 +1085,6 @@ class LagerSimulation(ShowBase):
         self.orders[order["id"]] = order
         self.orders_queue.append(order)
         self.next_order_id += 1
-
-        print(f"Neuer Auftrag erstellt: {order}")
 
     def erzeuge_wuerfel(self, x, y, z, color):
         wuerfel = self.loader.loadModel("models/box")
@@ -1348,16 +1106,18 @@ class LagerSimulation(ShowBase):
         return Task.cont
 
     def check_and_spawn_packages(self, task):
-        spawn_delay = 5.0  # 5 Sekunden Verzögerung zwischen Spawns
-        for station in self.annahme_stations:
-            # Wenn aktuell kein Paket an der Station ist
+        spawn_delay = self.package_spawn_delay
+        # Hier könnte man z. B. zusätzlich prüfen, ob die Station in der UI-Auswahl enthalten ist
+        target_stations = self.package_spawn_stations if hasattr(self,
+                                                                 'package_spawn_stations') else self.annahme_stations
+        for station in target_stations:
             if station not in self.pickup_packages:
                 last_time = self.last_removed.get(station, self.sim_clock)
-                # Prüfe, ob seit der letzten Entnahme mindestens 5 Sekunden vergangen sind
                 if (self.sim_clock - last_time) >= spawn_delay:
                     self.spawn_package_at_station(station)
         return Task.cont
 
+        # Beispiel für eine vorhandene Methode, die auf die Umgebungselemente zugreift:
     def update_order_table(self):
         # Lösche alle vorhandenen Einträge in der Auftragsliste.
         for entry in self.order_tree.get_children():
@@ -1391,7 +1151,7 @@ class LagerSimulation(ShowBase):
         for order_id, order in list(self.orders.items()):
             if order.get("status") == "Abgegeben" and self.sim_clock - order.get("delivered_at", 0) >= 2:
                 del self.orders[order_id]
-        if self.order_win is not None:
+        if hasattr(self, 'order_win') and self.order_win is not None:
             self.update_order_table()
         return Task.cont
 
@@ -1401,8 +1161,8 @@ class LagerSimulation(ShowBase):
             if order.get("status") == "Wartend":
                 order["status"] = "Abgegeben"
                 order["delivered_at"] = self.sim_clock
-                print(f"Auftrag {order['id']} wurde geliefert.")
                 break
+
 
     # ---------------7. Cargo-Handling (Pickup, Drop & Timer)---------------
     def pickup_package(self, vehicle, station):
@@ -1439,7 +1199,7 @@ class LagerSimulation(ShowBase):
             # und positioniere es relativ zum grünen Marker.
             package.wrtReparentTo(fork_node)
             package.setPos(green_point_pos.getX() + 0.5,
-                           green_point_pos.getY() - 0.5,
+                           green_point_pos.getY() + 0,
                            green_point_pos.getZ() + 1)
             self.cargos[vehicle] = package
 
@@ -1500,7 +1260,6 @@ class LagerSimulation(ShowBase):
         cargo.removeNode()  # Entfernt das Paket aus der Szene
         return task.done
 
-
     # ---------------8. Auftrags-/Fahrzeuglogik---------------
     def select_next_order(self, vehicle):
         # Sammle alle Aufträge, die noch "Wartend" sind
@@ -1526,36 +1285,38 @@ class LagerSimulation(ShowBase):
         return candidates[0]
 
     def show_vehicle_control(self):
-        # Falls das Fenster bereits existiert, bringe es einfach in den Vordergrund,
-        # ohne die Radiobuttons neu zu initialisieren.
+        # Falls das Fenster bereits existiert, wiederverwenden
         if hasattr(self, "control_win") and self.control_win.winfo_exists():
             self.control_win.deiconify()
             self.control_win.lift()
             self.control_win.focus_force()
             return
 
-        # Erstelle das Kontrollfenster als Toplevel des persistenten tk_root.
         self.control_win = tk.Toplevel(self.tk_root)
-        self.control_win.title("Fahrzeugsteuerung")
-        # Beim Schließen soll das Fenster nicht zerstört, sondern nur versteckt werden
+        self.control_win.title("Kontrollfenster")
         self.control_win.protocol("WM_DELETE_WINDOW", self.control_win.withdraw)
-        # Sorge dafür, dass das Fenster initial über allem liegt
         self.control_win.attributes("-topmost", True)
         self.control_win.after(100, lambda: self.control_win.attributes("-topmost", False))
 
-        # Erzeuge das Dictionary für die StringVar-Zuordnungen für die Fahrzeuge.
+        # ---------------- Fahrzeugsteuerung ----------------
+        # Zunächst einen Button einfügen, der ALLE Fahrzeuge auf "Aufträge bearbeiten" setzt.
+        all_vehicles_btn = tk.Button(
+            self.control_win,
+            text="Alle Fahrzeuge auf 'Aufträge bearbeiten' setzen",
+            command=lambda: [self.vehicle_state_vars[veh].set("translate") for veh in self.garage_vehicles]
+        )
+        all_vehicles_btn.grid(row=0, column=0, sticky="w", padx=5, pady=5)
+
+        # Nun die einzelnen Fahrzeugzeilen – starte ab Zeile 1
         self.vehicle_state_vars = {}
-        row = 0
+        row = 1
         for veh in self.garage_vehicles:
             frame = tk.Frame(self.control_win)
             frame.grid(row=row, column=0, sticky="w", padx=5, pady=2)
             vid = veh.getPythonTag("vehicle_id")
             label = tk.Label(frame, text=f"Fahrzeug {vid}")
             label.pack(side=tk.LEFT)
-            # Initialisiere die Radiobutton-Variable anhand des aktuellen Fahrzeugzustandes.
-            state = veh.getPythonTag("order_state")
-            if state is None:
-                state = "idle"
+            state = veh.getPythonTag("order_state") or "idle"
             var = tk.StringVar(value=state)
             self.vehicle_state_vars[veh] = var
             rb_active = tk.Radiobutton(frame, text="Aufträge bearbeiten", variable=var, value="translate")
@@ -1563,374 +1324,536 @@ class LagerSimulation(ShowBase):
             rb_standby = tk.Radiobutton(frame, text="Standby", variable=var, value="idle")
             rb_standby.pack(side=tk.LEFT)
             row += 1
+
         update_btn = tk.Button(self.control_win, text="Übernehmen", command=self.update_vehicle_control)
         update_btn.grid(row=row, column=0, pady=5)
+        row += 1
 
+        # ---------------- Spawn-Einstellungen ----------------
+        spawn_frame = tk.LabelFrame(self.control_win, text="Spawn Einstellungen", padx=5, pady=5)
+        spawn_frame.grid(row=row, column=0, sticky="w", padx=5, pady=5)
+
+        # Eingabe der Spawnverzögerung
+        tk.Label(spawn_frame, text="Spawnverzögerung (Sekunden):").grid(row=0, column=0, sticky="w")
+        self.spawn_delay_var = tk.DoubleVar(value=self.package_spawn_delay)
+        delay_entry = tk.Entry(spawn_frame, textvariable=self.spawn_delay_var, width=6)
+        delay_entry.grid(row=0, column=1, sticky="w")
+
+        # Direkt in diesem Spawn-Feld: Button, der alle Annahmestationen auswählt
+        btn_select_all_stations = tk.Button(
+            spawn_frame,
+            text="Alle Annahmestationen auswählen",
+            command=lambda: [self.spawn_station_vars[i].set(True) for i in self.spawn_station_vars]
+        )
+        btn_select_all_stations.grid(row=0, column=2, padx=5)
+
+        # Auswahl der Annahmestationen (Checkbuttons)
+        tk.Label(spawn_frame, text="Annahmestationen:").grid(row=1, column=0, sticky="w", pady=(5, 0))
+        stations_frame = tk.Frame(spawn_frame)
+        stations_frame.grid(row=2, column=0, columnspan=3, sticky="w")
+        for i in range(min(10, len(self.annahme_stations))):
+            cb = tk.Checkbutton(stations_frame, text=f"Annahmestation {i + 1}",
+                                variable=self.spawn_station_vars[i])
+            cb.pack(anchor="w")
+
+        def apply_spawn_from_control():
+            self.package_spawn_delay = self.spawn_delay_var.get()
+            selected = []
+            for i, var in self.spawn_station_vars.items():
+                if var.get():
+                    selected.append(self.annahme_stations[i])
+            self.package_spawn_stations = selected
+            # Spawne nur an Stationen, an denen noch kein Paket existiert:
+            for station in self.package_spawn_stations:
+                if station not in self.pickup_packages:
+                    self.spawn_package_at_station(station)
+            # Option: spawn_win schließen oder offen lassen
+            # self.control_win.withdraw()
+
+        apply_btn = tk.Button(
+            spawn_frame,
+            text="Einstellungen übernehmen und spawnen",
+            command=apply_spawn_from_control
+        )
+        apply_btn.grid(row=3, column=0, columnspan=3, pady=5)
+
+    def show_spawn_control(self):
+        spawn_win = tk.Toplevel(self.tk_root)
+        spawn_win.title("Paketspawn Einstellungen")
+
+        # Eingabefeld für Spawnverzögerung
+        tk.Label(spawn_win, text="Spawnverzögerung (Sekunden):").pack(pady=2)
+        delay_entry = tk.Entry(spawn_win)
+        delay_entry.insert(0, str(self.package_spawn_delay))
+        delay_entry.pack(pady=2)
+
+
+
+        # Checkbuttons für die Auswahl der Annahmestationen
+        tk.Label(spawn_win, text="Annahmestationen auswählen (1-10):").pack(pady=2)
+        stations_frame = tk.Frame(spawn_win)
+        stations_frame.pack(pady=2)
+
+        station_vars = {}
+        for idx, station in enumerate(self.annahme_stations):
+            var = tk.BooleanVar(value=False)
+            station_label = f"Annahmestation {idx + 1}"
+            cb = tk.Checkbutton(stations_frame, text=station_label, variable=var)
+            cb.pack(anchor="w")
+            station_vars[idx] = var
+
+        def apply_spawn_settings():
+            try:
+                new_delay = float(delay_entry.get())
+            except ValueError:
+                new_delay = self.package_spawn_delay
+            new_stations = []
+            for idx, var in station_vars.items():
+                if var.get():
+                    new_stations.append(self.annahme_stations[idx])
+
+            self.package_spawn_delay = new_delay
+            self.package_spawn_stations = new_stations
+
+            # Spawne nur dort Pakete, wo noch kein Paket vorhanden ist:
+            for station in self.package_spawn_stations:
+                if station not in self.pickup_packages:
+                    self.spawn_package_at_station(station)
+
+            spawn_win.destroy()
+
+        tk.Button(spawn_win, text="Einstellungen speichern", command=apply_spawn_settings).pack(pady=5)
     def vehicle_order_task(self, vehicle, task):
+        # Berechne das Zeitintervall (dt)
         dt = ClockObject.getGlobalClock().getDt() * self.speed_factor
         state = vehicle.getPythonTag("order_state")
-        current_order = vehicle.getPythonTag("current_order")
 
-        # ------------------ Phase 1: Translate (Fahrt zum Pickup) ------------------
+        # Zustandsbasierte Weiterleitung an die jeweiligen Handler
         if state == "translate":
-            # Falls noch kein Auftrag vorhanden, einen zuweisen
-            if current_order is None:
-                next_order = self.select_next_order(vehicle)
-                if next_order is not None:
-                    next_order["status"] = "In Bearbeitung"
-                    next_order["vehicle"] = f"Fahrzeug {vehicle.getPythonTag('vehicle_id')}"  # Neuer Eintrag!
-                    vehicle.setPythonTag("current_order", next_order)
-                    print(
-                        f"Auftrag {next_order['id']} wird zugewiesen für Fahrzeug {vehicle.getPythonTag('vehicle_id')}.")
-                else:
-                    print("Kein Auftrag verfügbar – Fallback zum globalen Ziel.")
-                current_order = vehicle.getPythonTag("current_order")
+            self.handle_translate_phase(vehicle, dt)
+        elif state == "rotate":
+            self.handle_rotate_phase(vehicle, dt)
+        elif state == "approach":
+            self.handle_approach_phase(vehicle, dt)
+        elif state == "pickup":
+            self.handle_pickup_phase(vehicle, dt)
+        elif state == "drive_out":
+            self.handle_drive_out_phase(vehicle, dt)
+        elif state == "to_delivery":
+            self.handle_to_delivery_phase(vehicle, dt)
+        elif state == "align_delivery":
+            self.handle_align_delivery_phase(vehicle, dt)
+        elif state == "delivery_center":
+            self.handle_delivery_center_phase(vehicle, dt)
+        elif state == "drop":
+            self.handle_drop_phase(vehicle, dt)
+        elif state == "phase11":
+            self.handle_phase11(vehicle, dt)
+        elif state == "return_to_garage":
+            self.handle_return_to_garage_phase(vehicle, dt)
+        else:
+            print(f"Unbekannter Zustand: {state}")
+        return Task.cont
 
-            # Ziel: Pickup-Station (über den blauen Marker)
-            if current_order is not None:
-                pickup_station = current_order.get("pickup_station")
-                if pickup_station in self.station_blue_dots:
-                    target = self.station_blue_dots[pickup_station].getPos(self.render)
-                else:
-                    target = self.blue_dot.getPos(self.render)
+    # -------------------- Handler für einzelne Phasen --------------------
+
+    def handle_translate_phase(self, vehicle, dt):
+        # Wenn noch kein Auftrag zugeordnet wurde, wähle einen Auftrag aus.
+        current_order = vehicle.getPythonTag("current_order")
+        if current_order is None:
+            next_order = self.select_next_order(vehicle)
+            if next_order is not None:
+                next_order["status"] = "In Bearbeitung"
+                next_order["vehicle"] = f"Fahrzeug {vehicle.getPythonTag('vehicle_id')}"
+                vehicle.setPythonTag("current_order", next_order)
+                print(f"Auftrag {next_order['id']} wird zugewiesen für Fahrzeug {vehicle.getPythonTag('vehicle_id')}.")
+            else:
+                print("Kein Auftrag verfügbar – Fallback zum globalen Ziel.")
+            current_order = vehicle.getPythonTag("current_order")
+
+        # Bestimme das Ziel (Pickup-Station über den blauen Marker)
+        if current_order is not None:
+            pickup_station = current_order.get("pickup_station")
+            if pickup_station in self.station_blue_dots:
+                target = self.station_blue_dots[pickup_station].getPos(self.render)
             else:
                 target = self.blue_dot.getPos(self.render)
+        else:
+            target = self.blue_dot.getPos(self.render)
 
-            current_pos = vehicle.getPos(self.render)
-            pivot = vehicle.getPythonTag("steering_axis")
-            global_hpr = pivot.getNetTransform().getHpr()  # Liefert Vec3(H, P, R)
-            global_heading = global_hpr.getX()  # Heading in Grad
-            current_heading_rad = math.radians(global_heading)
+        current_pos = vehicle.getPos(self.render)
+        pivot = vehicle.getPythonTag("steering_axis")
 
-            # Berechne gewünschten Heading anhand der Differenz zum Ziel
-            desired_heading_rad = math.atan2(target.getY() - current_pos.getY(),
-                                             target.getX() - current_pos.getX())
-            heading_error = desired_heading_rad - current_heading_rad
-            while heading_error > math.pi:
-                heading_error -= 2 * math.pi
-            while heading_error < -math.pi:
-                heading_error += 2 * math.pi
+        # Berechne den tatsächlichen Steuerpunkt (also den Offset-Punkt)
+        offset_pos = current_pos + vehicle.getQuat(self.render).xform(self.pickup_offset)
 
-            gain = 1.0
-            max_delta = gain * dt
-            delta_heading_rad = max(-max_delta, min(max_delta, heading_error))
-            delta_heading_deg = math.degrees(delta_heading_rad)
+        # Berechne den gewünschten Heading-Winkel: Richtung von Offset-Punkt zum Ziel
+        desired_heading_rad = math.atan2(target.getY() - offset_pos.getY(),
+                                         target.getX() - offset_pos.getX())
 
-            self.rotate_around_pivot(vehicle, pivot, delta_heading_deg)
+        # Ermittle aktuellen Heading-Winkel über den `steering_axis`
+        global_hpr = pivot.getNetTransform().getHpr()
+        current_heading_rad = math.radians(global_hpr.getX())
 
-            # Berechne die neue Position (ohne Kollisionsvermeidung)
-            global_hpr = pivot.getNetTransform().getHpr()  # nach Rotation
-            new_global_heading = global_hpr.getX()
-            new_heading_rad = math.radians(new_global_heading)
-            speed = 1.5
-            new_x = current_pos.getX() + speed * math.cos(new_heading_rad) * dt
-            new_y = current_pos.getY() + speed * math.sin(new_heading_rad) * dt
-            new_pos = Vec3(new_x, new_y, 0)
-            vehicle.setPos(new_pos)
+        # Berechnung des Fehlerwinkels
+        heading_error = desired_heading_rad - current_heading_rad
+        while heading_error > math.pi:
+            heading_error -= 2 * math.pi
+        while heading_error < -math.pi:
+            heading_error += 2 * math.pi
 
-            if (math.sqrt((target.getX() - new_pos.getX()) ** 2 + (target.getY() - new_pos.getY()) ** 2) < 0.1):
-                vehicle.setPos(target)
-                vehicle.setPythonTag("order_state", "rotate")
+        # Drehung zur Korrektur, nur basierend auf Fehlerwinkel
+        gain = 1.0
+        max_delta = gain * dt
+        delta_heading_rad = max(-max_delta, min(max_delta, heading_error))
+        self.rotate_around_pivot(vehicle, pivot, math.degrees(delta_heading_rad))
 
-        # ------------------ Phase 2: Rotate ------------------
-        elif state == "rotate":
-            desired_angle = math.degrees(math.atan2(self.station_white_direction.getY(),
-                                                    self.station_white_direction.getX()))
-            desired_angle = (desired_angle + 180) % 360
-            current_heading = vehicle.getH() % 360
-            angle_diff = ((desired_angle - current_heading + 180) % 360) - 180
-            kp_heading = 0.5
-            new_heading = current_heading + kp_heading * angle_diff
-            vehicle.setH(new_heading)
-            if abs(angle_diff) < 1.0:
-                vehicle.setPythonTag("order_state", "turn_right")
+        # Bewege das Fahrzeug entlang der neuen Richtung
+        global_hpr = pivot.getNetTransform().getHpr()
+        new_heading_rad = math.radians(global_hpr.getX())
+        speed = 1.5
+        new_x = current_pos.getX() + speed * math.cos(new_heading_rad) * dt
+        new_y = current_pos.getY() + speed * math.sin(new_heading_rad) * dt
+        new_pos = Vec3(new_x, new_y, 0)
+        vehicle.setPos(new_pos)
 
-        # ------------------ Phase 3: Turn Right ------------------
-        elif state == "turn_right":
-            if vehicle.getPythonTag("turn_right_init") is None:
-                vehicle.setPythonTag("turn_right_init", vehicle.getH() % 360)
-                vehicle.setPythonTag("turn_right_target", (vehicle.getPythonTag("turn_right_init") + 90) % 360)
-                print("Phase 3: Initialisiert für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      "Start Heading =", vehicle.getPythonTag("turn_right_init"),
-                      "Target Heading =", vehicle.getPythonTag("turn_right_target"))
-            current_heading = vehicle.getH() % 360
-            turn_right_target = vehicle.getPythonTag("turn_right_target")
-            angle_diff = ((turn_right_target - current_heading + 180) % 360) - 180
-            kp_turn = 0.5
-            turn_rate = kp_turn * angle_diff
-            new_heading = current_heading + turn_rate * dt
-            vehicle.setH(new_heading)
-            print("Phase 3: Fahrzeug", vehicle.getPythonTag("vehicle_id"), "- Aktuelles Heading =", current_heading,
-                  "Winkelabweichung =", angle_diff, "Neues Heading =", new_heading)
-            if abs(angle_diff) < 1.0:
-                print("Phase 3: Drehung abgeschlossen für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      ". Übergang in 'approach'.")
-                vehicle.setPythonTag("order_state", "approach")
-                vehicle.clearPythonTag("turn_right_init")
-                vehicle.clearPythonTag("turn_right_target")
+        # Aktualisiere den Offset-Punkt (Steuerachse) nach der Bewegung
+        new_offset_pos = vehicle.getPos(self.render) + vehicle.getQuat(self.render).xform(self.pickup_offset)
 
-        # ------------------ Phase 4: Approach ------------------
-        elif state == "approach":
-            if current_order is not None:
-                pickup_station = current_order.get("pickup_station")
-                target = pickup_station.getPos(self.render) + Vec3(1.2, 1, 0)
-            else:
-                target = self.station_green_dot.getPos(self.render) + Vec3(1.2, 1, 0)
-            current = vehicle.getPos(self.render)
-            error_vec = Vec2(target.getX() - current.getX(), target.getY() - current.getY())
-            if error_vec.length() > 0.05:
-                direction = error_vec.normalized()
-                move_distance = 1.5 * dt
-                new_pos = Vec3(current.getX() + direction.getX() * move_distance,
-                               current.getY() + direction.getY() * move_distance, target.getZ())
-                vehicle.setPos(new_pos)
-            else:
-                vehicle.setPos(target)
-                vehicle.setPythonTag("order_state", "pickup")
+        # Prüfe, ob sich der Offset-Punkt exakt auf dem Ziel befindet
+        if (target - new_offset_pos).length() < 0.1:
+            vehicle.setPythonTag("order_state", "rotate")  # Wechsel zur nächsten Phase
 
-        # ------------------ Phase 5: Pickup ------------------
-        elif state == "pickup":
-            fork_node = vehicle.getPythonTag("fork_node")
-            current_z = fork_node.getZ()
-            target_z = 1.0
-            raise_speed = 0.5
-            if current_z < target_z:
-                fork_node.setZ(min(target_z, current_z + raise_speed * dt))
-            else:
-                if current_order is None:
-                    if self.orders_queue:
-                        vehicle.setPythonTag("current_order", self.orders_queue.pop(0))
-                    else:
-                        print("Keine verfügbaren Aufträge für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                              ". Überspringe Pickup-Phase.")
-                        vehicle.setPythonTag("order_state", "drive_out")
-                        return task.cont
-                if not vehicle.getPythonTag("package_attached"):
-                    pickup_station = vehicle.getPythonTag("current_order")["pickup_station"]
-                    self.pickup_package(vehicle, pickup_station)
-                    vehicle.setPythonTag("package_attached", True)
-                if vehicle.getPythonTag("drive_out_target") is None:
-                    vehicle.setPythonTag("drive_out_target",
-                                         vehicle.getPos(self.render) + vehicle.getQuat(self.render).getForward() * 5.0)
-                vehicle.setPythonTag("order_state", "drive_out")
+    def handle_rotate_phase(self, vehicle, dt):
+        import math
+        from panda3d.core import Vec3
 
-        # ------------------ Phase 6: Drive Out ------------------
-        elif state == "drive_out":
-            fork_node = vehicle.getPythonTag("fork_node")
-            current_z = fork_node.getZ()
-            if current_z > 0.0:
-                lower_speed = 0.5
-                fork_node.setZ(max(0.0, current_z - lower_speed * dt))
-            current_pos = vehicle.getPos(self.render)
-            drive_out_target = vehicle.getPythonTag("drive_out_target")
-            if drive_out_target is None:
-                drive_out_target = current_pos + vehicle.getQuat(self.render).getForward() * 5.0
-                vehicle.setPythonTag("drive_out_target", drive_out_target)
-            diff = drive_out_target - current_pos
-            if diff.length() > 0.1:
-                move_distance = 0.5 * dt
-                step = diff.normalized() * move_distance
-                new_pos = current_pos + step
-                new_pos.setZ(0)  # Fahrzeug bleibt am Boden
-                vehicle.setPos(new_pos)
-            else:
-                vehicle.setPythonTag("order_state", "to_delivery")
-                vehicle.setPythonTag("drive_out_target", None)
+        # 1. Hole den grünen Referenzpunkt (fork_green) der Gabel.
+        fork_green = vehicle.getPythonTag("fork_green")
+        if not fork_green or fork_green.isEmpty():
+            print("[DEBUG] handle_rotate_phase: Kein fork_green gefunden!")
+            return
 
-        # ------------------ Phase 7: To Delivery (Fahrt zur Abgabestation) ------------------
-        elif state == "to_delivery":
-            if current_order is None:
-                return Task.cont
-            delivery_target_str = current_order.get("ziel", "Abgabestation 1")
-            try:
-                target_index = int(delivery_target_str.split()[-1])
-            except ValueError:
-                target_index = 1
-            if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
-                target = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
-            else:
-                target = self.abgabe_blue_dots[0].getPos(self.render)
+        # 2. Hole den aktuellen Auftrag und die zugehörige Pickup-Station.
+        current_order = vehicle.getPythonTag("current_order")
+        if not current_order or "pickup_station" not in current_order:
+            print("[DEBUG] handle_rotate_phase: Kein aktueller Auftrag oder Station gefunden!")
+            return
+        station = current_order["pickup_station"]
 
-            current_pos = vehicle.getPos(self.render)
-            pivot = vehicle.getPythonTag("steering_axis")
-            global_hpr = pivot.getNetTransform().getHpr()
-            global_heading = global_hpr.getX()  # in Grad
-            current_heading_rad = math.radians(global_heading)
-            desired_heading_rad = math.atan2(target.getY() - current_pos.getY(),
-                                             target.getX() - current_pos.getX())
-            heading_error = desired_heading_rad - current_heading_rad
-            while heading_error > math.pi:
-                heading_error -= 2 * math.pi
-            while heading_error < -math.pi:
-                heading_error += 2 * math.pi
-            gain = 1.0
-            max_delta = gain * dt
-            delta_heading_rad = max(-max_delta, min(max_delta, heading_error))
-            delta_heading_deg = math.degrees(delta_heading_rad)
-            self.rotate_around_pivot(vehicle, pivot, delta_heading_deg)
-            global_hpr = pivot.getNetTransform().getHpr()
-            new_global_heading = global_hpr.getX()
-            new_heading_rad = math.radians(new_global_heading)
-            speed = 1.5
-            new_x = current_pos.getX() + speed * math.cos(new_heading_rad) * dt
-            new_y = current_pos.getY() + speed * math.sin(new_heading_rad) * dt
-            new_pos = Vec3(new_x, new_y, 0)
-            vehicle.setPos(new_pos)
+        # Hole den Referenzpunkt der Station (white_center) und den Richtungsvektor (white_direction)
+        white_center = station.getPythonTag("white_center")
+        if white_center is None:
+            print("[DEBUG] handle_rotate_phase: Kein white_center in der Station gefunden!")
+            return
+        target = white_center  # Ziel: Mittelpunkt der weißen Linie
 
-            if math.sqrt((target.getX() - new_pos.getX()) ** 2 + (target.getY() - new_pos.getY()) ** 2) < 0.5:
-                print(
-                    f"Phase 7 abgeschlossen: Fahrzeug {vehicle.getPythonTag('vehicle_id')} hat den blauen Punkt erreicht.")
-                vehicle.setPythonTag("order_state", "align_delivery")
+        # 3. Berechne den Drehpunkt des Fahrzeugs.
+        pivot = vehicle.getPos(self.render) + vehicle.getQuat(self.render).xform(self.pickup_offset)
 
-        # ------------------ Phase 8: Align Delivery ------------------
-        elif state == "align_delivery":
-            desired_heading = 90.0
-            current_heading = vehicle.getH() % 360
-            angle_diff = ((desired_heading - current_heading + 180) % 360) - 180
-            print("Phase 8: Align Delivery | Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                  f"Current Heading: {current_heading:.2f}°, Desired: {desired_heading:.2f}°, Diff: {angle_diff:.2f}°")
-            fixed_turn_speed = 90.0
-            turn_amount = fixed_turn_speed * dt
-            if abs(angle_diff) < 1.0:
-                vehicle.setH(desired_heading)
-                print("Phase 8 abgeschlossen: Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      f"ausgerichtet (Heading = {desired_heading:.2f}°).")
-                vehicle.setPythonTag("order_state", "delivery_center")
-            else:
-                if angle_diff > 0:
-                    new_heading = current_heading + turn_amount
-                else:
-                    new_heading = current_heading - turn_amount
-                new_heading %= 360
-                vehicle.setH(new_heading)
-                print("Phase 8: Rotating - Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      f"New Heading set to {new_heading:.2f}°")
+        # 4. Falls sich der pivot nahe am Ziel befindet, final: Setze die exakte Ausrichtung.
+        distance = (target - pivot).length()
+        stop_threshold = 0.5  # Schwellenwert, evtl. an Modelldimensionen anpassen
+        if distance < stop_threshold:
+            desired_vector = target - pivot
+            desired_angle = math.degrees(math.atan2(desired_vector.getY(), desired_vector.getX())) + 90
+            desired_angle %= 360
+            vehicle.setH(self.render, desired_angle)
+            print(f"[DEBUG] final step: Fahrzeugheading auf {desired_angle:.2f}° gesetzt.")
 
-        # ------------------ Phase 9: Delivery Approach ------------------
-        elif state == "delivery_center":
-            delivery_target_str = current_order.get("ziel", "Abgabestation 1")
-            try:
-                target_index = int(delivery_target_str.split()[-1])
-            except ValueError:
-                target_index = 1
-            if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
-                blue_target = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
-            else:
-                blue_target = self.abgabe_blue_dots[0].getPos(self.render)
-            current = vehicle.getPos(self.render)
-            target_point = Vec3(blue_target.getX() + 2.3, blue_target.getY() - 0.5, current.getZ())
-            print("Phase 9: Zielpunkt der Abgabestation für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                  "=", target_point)
-            error_vec = Vec2(target_point.getX() - current.getX(), target_point.getY() - current.getY())
-            tolerance = 0.05
+            # Final: Richte den grünen Richtungspfeil ("fork_center_line") exakt aus.
+            white_direction = station.getPythonTag("white_direction")
+            if white_direction is not None:
+                desired_arrow_angle = math.degrees(math.atan2(white_direction.getY(), white_direction.getX()))
+                arrow_relative = (desired_arrow_angle - desired_angle + 180) % 360 - 180
+                fork_center_line = vehicle.getPythonTag("fork_center_line")
+                if fork_center_line:
+                    fork_center_line.setH(arrow_relative)
+                    print(f"[DEBUG] final step: Grüner Pfeil auf relativen Winkel {arrow_relative:.2f}° gesetzt.")
+            # Hier ändern wir den Zustand in 'approach' statt "next_phase"
+            vehicle.setPythonTag("order_state", "approach")
+            return
+
+        # 5. Andernfalls: Berechne den gewünschten globalen Winkel (inklusive +90°-Offset)
+        desired_vector = target - pivot
+        desired_angle = math.degrees(math.atan2(desired_vector.getY(), desired_vector.getX())) + 90
+        desired_angle %= 360
+
+        # 6. Ermittle den aktuellen Fahrzeugheading in Weltkoordinaten und berechne die Winkelabweichung.
+        current_heading = vehicle.getH(self.render)
+        angle_diff = (desired_angle - current_heading + 180) % 360 - 180
+
+        if abs(angle_diff) < 2.0:
+            vehicle.setH(self.render, desired_angle)
+            white_direction = station.getPythonTag("white_direction")
+            if white_direction is not None:
+                desired_arrow_angle = math.degrees(math.atan2(white_direction.getY(), white_direction.getX()))
+                arrow_relative = (desired_arrow_angle - desired_angle + 180) % 360 - 180
+                fork_center_line = vehicle.getPythonTag("fork_center_line")
+                if fork_center_line:
+                    fork_center_line.setH(arrow_relative)
+                    print(f"[DEBUG] fine alignment: Grüner Pfeil auf {arrow_relative:.2f}° gesetzt.")
+            # Ändere auch hier sofort den Zustand in "approach"
+            vehicle.setPythonTag("order_state", "approach")
+            return
+
+        # 7. Begrenze die Drehung pro Frame (z.B. 20,9° pro Sekunde)
+        max_rotation_speed = 20.9  # Grad pro Sekunde
+        max_delta = max_rotation_speed * dt
+        delta_angle = max(-max_delta, min(max_delta, angle_diff))
+
+        # 8. Drehe das Fahrzeug schrittweise um delta_angle
+        temp_pivot = self.render.attachNewNode("temp_pivot")
+        temp_pivot.setPos(pivot)
+        self.rotate_around_pivot(vehicle, temp_pivot, delta_angle)
+        temp_pivot.removeNode()
+
+        print(f"[DEBUG] rotating: Gedreht um {delta_angle:.2f}°; Restliche Differenz: {angle_diff - delta_angle:.2f}°")
+
+    def handle_approach_phase(self, vehicle, dt):
+        current_order = vehicle.getPythonTag("current_order")
+        if current_order is not None:
+            pickup_station = current_order.get("pickup_station")
+            target = pickup_station.getPos(self.render) + Vec3(1.2, 1, 0)
+        else:
+            target = self.station_green_dot.getPos(self.render) + Vec3(1.2, 1, 0)
+        current = vehicle.getPos(self.render)
+        error_vec = Vec2(target.getX() - current.getX(), target.getY() - current.getY())
+        if error_vec.length() > 0.05:
+            direction = error_vec.normalized()
             move_distance = 1.5 * dt
-            if error_vec.length() > tolerance:
-                direction = error_vec.normalized()
-                new_pos = Vec3(current.getX() + direction.getX() * move_distance,
-                               current.getY() + direction.getY() * move_distance, current.getZ())
-                vehicle.setPos(new_pos)
-                print("Phase 9: Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      "bewegt sich von", current, "nach", new_pos)
-            else:
-                vehicle.setPos(target_point)
-                print("Phase 9: Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      "hat den Zielpunkt erreicht.")
-                vehicle.setPythonTag("order_state", "drop")
+            new_pos = Vec3(current.getX() + direction.getX() * move_distance,
+                           current.getY() + direction.getY() * move_distance, target.getZ())
+            vehicle.setPos(new_pos)
+        else:
+            vehicle.setPos(target)
+            vehicle.setPythonTag("order_state", "pickup")
+
+    def handle_pickup_phase(self, vehicle, dt):
+        fork_node = vehicle.getPythonTag("fork_node")
+        current_z = fork_node.getZ()
+        target_z = 1.0
+        raise_speed = 0.5
+        if current_z < target_z:
+            fork_node.setZ(min(target_z, current_z + raise_speed * dt))
+        else:
+            if vehicle.getPythonTag("current_order") is None:
+                if self.orders_queue:
+                    vehicle.setPythonTag("current_order", self.orders_queue.pop(0))
+                else:
+                    print(
+                        f"Keine verfügbaren Aufträge für Fahrzeug {vehicle.getPythonTag('vehicle_id')}. Überspringe Pickup-Phase.")
+                    vehicle.setPythonTag("order_state", "drive_out")
+                    return
+            if not vehicle.getPythonTag("package_attached"):
+                pickup_station = vehicle.getPythonTag("current_order")["pickup_station"]
+                self.pickup_package(vehicle, pickup_station)
+                vehicle.setPythonTag("package_attached", True)
+            if vehicle.getPythonTag("drive_out_target") is None:
+                vehicle.setPythonTag("drive_out_target",
+                                     vehicle.getPos(self.render) + vehicle.getQuat(self.render).getForward() * 5.0)
+            vehicle.setPythonTag("order_state", "drive_out")
+
+    def handle_drive_out_phase(self, vehicle, dt):
+        fork_node = vehicle.getPythonTag("fork_node")
+        current_z = fork_node.getZ()
+        if current_z > 0:
+            lower_speed = 0.5
+            fork_node.setZ(max(0, current_z - lower_speed * dt))
+        current_pos = vehicle.getPos(self.render)
+        drive_out_target = vehicle.getPythonTag("drive_out_target")
+        if drive_out_target is None:
+            drive_out_target = current_pos + vehicle.getQuat(self.render).getForward() * 5.0
+            vehicle.setPythonTag("drive_out_target", drive_out_target)
+        diff = drive_out_target - current_pos
+        if diff.length() > 0.1:
+            move_distance = 0.5 * dt
+            step = diff.normalized() * move_distance
+            new_pos = current_pos + step
+            new_pos.setZ(0)
+            vehicle.setPos(new_pos)
+        else:
+            vehicle.setPythonTag("order_state", "to_delivery")
+            vehicle.setPythonTag("drive_out_target", None)
+
+    def handle_to_delivery_phase(self, vehicle, dt):
+        current_order = vehicle.getPythonTag("current_order")
+        if current_order is None:
+            return
+        # Ziel der Abgabestation als Vektor verwenden:
+        delivery_target_str = current_order.get("ziel", "Abgabestation 1")
+        try:
+            target_index = int(delivery_target_str.split()[-1])
+        except ValueError:
+            target_index = 1
+        if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
+            target = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
+        else:
+            target = self.abgabe_blue_dots[0].getPos(self.render)
+        current_pos = vehicle.getPos(self.render)
+        pivot = vehicle.getPythonTag("steering_axis")
+        global_hpr = pivot.getNetTransform().getHpr()
+        global_heading = global_hpr.getX()
+        current_heading_rad = math.radians(global_heading)
+        desired_heading_rad = math.atan2(target.getY() - current_pos.getY(),
+                                         target.getX() - current_pos.getX())
+        heading_error = desired_heading_rad - current_heading_rad
+        while heading_error > math.pi:
+            heading_error -= 2 * math.pi
+        while heading_error < -math.pi:
+            heading_error += 2 * math.pi
+        gain = 1.0
+        max_delta = gain * dt
+        delta_heading_rad = max(-max_delta, min(max_delta, heading_error))
+        self.rotate_around_pivot(vehicle, pivot, math.degrees(delta_heading_rad))
+        global_hpr = pivot.getNetTransform().getHpr()
+        new_heading_rad = math.radians(global_hpr.getX())
+        speed = 1.5
+        new_x = current_pos.getX() + speed * math.cos(new_heading_rad) * dt
+        new_y = current_pos.getY() + speed * math.sin(new_heading_rad) * dt
+        new_pos = Vec3(new_x, new_y, 0)
+        vehicle.setPos(new_pos)
+        if math.sqrt((target.getX() - new_pos.getX()) ** 2 + (target.getY() - new_pos.getY()) ** 2) < 0.5:
+            print(
+                f"Phase 7 abgeschlossen: Fahrzeug {vehicle.getPythonTag('vehicle_id')} hat den blauen Punkt erreicht.")
+            vehicle.setPythonTag("order_state", "align_delivery")
+
+    def handle_align_delivery_phase(self, vehicle, dt):
+        desired_heading = 90.0
+        current_heading = vehicle.getH() % 360
+        angle_diff = ((desired_heading - current_heading + 180) % 360) - 180
+        print(
+            f"Phase 8: Align Delivery | Fahrzeug {vehicle.getPythonTag('vehicle_id')}: Current {current_heading:.2f}°, Desired {desired_heading:.2f}°, Diff {angle_diff:.2f}°")
+        fixed_turn_speed = 90.0
+        turn_amount = fixed_turn_speed * dt
+        if abs(angle_diff) < 1.0:
+            vehicle.setH(desired_heading)
+            print(
+                f"Phase 8 abgeschlossen: Fahrzeug {vehicle.getPythonTag('vehicle_id')} ausgerichtet (Heading = {desired_heading:.2f}°).")
+            vehicle.setPythonTag("order_state", "delivery_center")
+        else:
+            new_heading = current_heading + (turn_amount if angle_diff > 0 else -turn_amount)
+            new_heading %= 360
+            vehicle.setH(new_heading)
+            print(f"Phase 8: Rotating - Fahrzeug {vehicle.getPythonTag('vehicle_id')} New Heading: {new_heading:.2f}°")
+
+    def handle_delivery_center_phase(self, vehicle, dt):
+        current_order = vehicle.getPythonTag("current_order")
+        if current_order is None:
+            return
+        delivery_target_str = current_order.get("ziel", "Abgabestation 1")
+        try:
+            target_index = int(delivery_target_str.split()[-1])
+        except ValueError:
+            target_index = 1
+        if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
+            blue_target = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
+        else:
+            blue_target = self.abgabe_blue_dots[0].getPos(self.render)
+        current = vehicle.getPos(self.render)
+        target_point = Vec3(blue_target.getX() + 2.3, blue_target.getY() - 0.5, current.getZ())
+        print(f"Phase 9: Zielpunkt der Abgabestation für Fahrzeug {vehicle.getPythonTag('vehicle_id')}: {target_point}")
+        error_vec = Vec2(target_point.getX() - current.getX(), target_point.getY() - current.getY())
+        tolerance = 0.05
+        move_distance = 1.5 * dt
+        if error_vec.length() > tolerance:
+            direction = error_vec.normalized()
+            new_pos = Vec3(current.getX() + direction.getX() * move_distance,
+                           current.getY() + direction.getY() * move_distance, current.getZ())
+            vehicle.setPos(new_pos)
+            print(f"Phase 9: Fahrzeug {vehicle.getPythonTag('vehicle_id')} bewegt sich von {current} nach {new_pos}")
+        else:
+            vehicle.setPos(target_point)
+            print(f"Phase 9: Fahrzeug {vehicle.getPythonTag('vehicle_id')} hat den Zielpunkt erreicht.")
+            vehicle.setPythonTag("order_state", "drop")
+        fork_node = vehicle.getPythonTag("fork_node")
+        current_fork_z = fork_node.getZ()
+        if current_fork_z < 1.0:
+            new_fork_z = min(1.0, current_fork_z + 0.5 * dt)
+            fork_node.setZ(new_fork_z)
+            print(
+                f"Phase 9: Gabel wird angehoben für Fahrzeug {vehicle.getPythonTag('vehicle_id')} (Z = {new_fork_z}).")
+
+    def handle_drop_phase(self, vehicle, dt):
+        current_order = vehicle.getPythonTag("current_order")
+        if vehicle.getPythonTag("package_attached"):
+            delivery_target_str = current_order.get("ziel", "Abgabestation 1")
+            try:
+                target_index = int(delivery_target_str.split()[-1])
+            except ValueError:
+                target_index = 1
+            # (Bei Bedarf kann man hier noch Zielpositionen abfragen.)
+            self.drop_cargo(vehicle)
+            print(f"Phase 10: Paket abgesetzt für Fahrzeug {vehicle.getPythonTag('vehicle_id')}")
+            vehicle.setPythonTag("package_attached", False)
+        else:
             fork_node = vehicle.getPythonTag("fork_node")
-            current_fork_z = fork_node.getZ()
-            if current_fork_z < 1.0:
-                new_fork_z = min(1.0, current_fork_z + 0.5 * dt)
-                fork_node.setZ(new_fork_z)
-                print("Phase 9: Gabel wird angehoben für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      f"(Z = {new_fork_z}).")
-
-        # ------------------ Phase 10: Dropoff ------------------
-        elif state == "drop":
-            if vehicle.getPythonTag("package_attached"):
-                delivery_target_str = current_order.get("ziel", "Abgabestation 1")
-                try:
-                    target_index = int(delivery_target_str.split()[-1])
-                except ValueError:
-                    target_index = 1
-                if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
-                    blue_target = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
-                else:
-                    blue_target = self.abgabe_blue_dots[0].getPos(self.render)
-                self.drop_cargo(vehicle)
-                print("Phase 10: Paket abgesetzt für Fahrzeug", vehicle.getPythonTag("vehicle_id"))
-                vehicle.setPythonTag("package_attached", False)
+            current_z = fork_node.getZ()
+            if current_z > 0:
+                lower_speed = 0.5
+                new_z = max(0, current_z - lower_speed * dt)
+                fork_node.setZ(new_z)
+                print(
+                    f"Phase 10: Gabel wird abgesenkt für Fahrzeug {vehicle.getPythonTag('vehicle_id')}, aktueller Z-Wert: {new_z}")
             else:
-                fork_node = vehicle.getPythonTag("fork_node")
-                current_z = fork_node.getZ()
-                if current_z > 0.0:
-                    lower_speed = 0.5
-                    new_z = max(0.0, current_z - lower_speed * dt)
-                    fork_node.setZ(new_z)
-                    print("Phase 10: Gabel wird abgesenkt für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                          f", aktueller Z-Wert = {new_z}")
+                print(f"Phase 10: Dropoff abgeschlossen für Fahrzeug {vehicle.getPythonTag('vehicle_id')}")
+                if vehicle.getPythonTag("standby_pending"):
+                    vehicle.setPythonTag("order_state", "return_to_garage")
+                    print(f"Fahrzeug {vehicle.getPythonTag('vehicle_id')} kehrt zur Garage zurück (Standby).")
                 else:
-                    print("Phase 10: Dropoff vollständig abgeschlossen für Fahrzeug",
-                          vehicle.getPythonTag("vehicle_id"))
-                    if vehicle.getPythonTag("standby_pending"):
-                        vehicle.setPythonTag("order_state", "return_to_garage")
-                        print(f"Fahrzeug {vehicle.getPythonTag('vehicle_id')} kehrt zur Garage zurück (Standby).")
-                    else:
-                        vehicle.setPythonTag("order_state", "translate")
-                    current_order["status"] = "Abgegeben"
-                    current_order["delivered_at"] = self.sim_clock
-                    vehicle.setPythonTag("current_order", None)
+                    vehicle.setPythonTag("order_state", "translate")
+                current_order["status"] = "Abgegeben"
+                current_order["delivered_at"] = self.sim_clock
+                vehicle.clearPythonTag("current_order")
 
-        # ------------------ Phase 11: Exit Station and Start Next Order ------------------
-        elif state == "phase11":
-            if vehicle.getPythonTag("last_delivery_marker") is not None:
-                target_point = vehicle.getPythonTag("last_delivery_marker")
+    def handle_phase11(self, vehicle, dt):
+        current_order = vehicle.getPythonTag("current_order")
+        if vehicle.getPythonTag("last_delivery_marker") is not None:
+            target_point = vehicle.getPythonTag("last_delivery_marker")
+        else:
+            delivery_target_str = current_order.get("ziel", "Abgabestation 1")
+            try:
+                target_index = int(delivery_target_str.split()[-1])
+            except ValueError:
+                target_index = 1
+            if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
+                target_point = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
             else:
-                delivery_target_str = current_order.get("ziel", "Abgabestation 1")
-                try:
-                    target_index = int(delivery_target_str.split()[-1])
-                except ValueError:
-                    target_index = 1
-                if 0 <= target_index - 1 < len(self.abgabe_blue_dots):
-                    target_point = self.abgabe_blue_dots[target_index - 1].getPos(self.render)
-                else:
-                    target_point = self.abgabe_blue_dots[0].getPos(self.render)
-                print("Phase 11: Zielpunkt (blauer Marker) für Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                      "=", target_point)
-                current_pos = vehicle.getPos(self.render)
-                diff = target_point - current_pos
-                if diff.length() > 0.1:
-                    move_distance = 0.5 * dt
-                    step = diff.normalized() * move_distance
-                    new_pos = current_pos + step
-                    vehicle.setPos(new_pos)
-                    print("Phase 11: Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                          "fährt aus der Station, neue Position =", new_pos)
-                else:
-                    vehicle.setPos(target_point)
-                    print("Phase 11: Fahrzeug", vehicle.getPythonTag("vehicle_id"),
-                          "hat den blauen Marker erreicht. Nächster Auftrag wird gestartet.")
-                    vehicle.setPythonTag("order_state", "next_order")
+                target_point = self.abgabe_blue_dots[0].getPos(self.render)
+        print(f"Phase 11: Zielpunkt (blauer Marker) für Fahrzeug {vehicle.getPythonTag('vehicle_id')}: {target_point}")
+        current_pos = vehicle.getPos(self.render)
+        diff = target_point - current_pos
+        if diff.length() > 0.1:
+            move_distance = 0.5 * dt
+            step = diff.normalized() * move_distance
+            new_pos = current_pos + step
+            vehicle.setPos(new_pos)
+            print(
+                f"Phase 11: Fahrzeug {vehicle.getPythonTag('vehicle_id')} fährt aus der Station, neue Position: {new_pos}")
+        else:
+            vehicle.setPos(target_point)
+            print(
+                f"Phase 11: Fahrzeug {vehicle.getPythonTag('vehicle_id')} hat den blauen Marker erreicht. Nächster Auftrag wird gestartet.")
+            vehicle.setPythonTag("order_state", "next_order")
 
-        # ------------------ Return to Garage (Standby) ------------------
-        elif state == "return_to_garage":
-            garage_target = vehicle.getPythonTag("garage_target")
-            if garage_target is None:
-                garage_target = self.garagen_parking_points[0]
-            current_pos = vehicle.getPos(self.render)
-            diff = garage_target - current_pos
-            if diff.length() > 0.1:
-                move_distance = 1.0 * dt
-                new_pos = current_pos + diff.normalized() * move_distance
-                new_pos.setZ(0)  # Fahrzeug auf Boden bleiben
-                vehicle.setPos(new_pos)
-            else:
-                if vehicle.hasPythonTag("start_heading"):
-                    vehicle.setH(vehicle.getPythonTag("start_heading"))
-                vehicle.setPythonTag("order_state", "idle")
-                vehicle.setPythonTag("standby_pending", False)
-                print(f"Fahrzeug {vehicle.getPythonTag('vehicle_id')} ist in der Garage (Standby).")
+    def handle_return_to_garage_phase(self, vehicle, dt):
+        garage_target = vehicle.getPythonTag("garage_target")
+        if garage_target is None:
+            garage_target = self.garagen_parking_points[0]
+        current_pos = vehicle.getPos(self.render)
+        diff = garage_target - current_pos
+        if diff.length() > 0.1:
+            move_distance = 1.0 * dt
+            new_pos = current_pos + diff.normalized() * move_distance
+            new_pos.setZ(0)
+            vehicle.setPos(new_pos)
+        else:
+            if vehicle.hasPythonTag("start_heading"):
+                vehicle.setH(vehicle.getPythonTag("start_heading"))
+            vehicle.setPythonTag("order_state", "idle")
+            vehicle.setPythonTag("standby_pending", False)
+            print(f"Fahrzeug {vehicle.getPythonTag('vehicle_id')} ist in der Garage (Standby).")
 
-        return task.cont
 
 
 if __name__ == "__main__":
