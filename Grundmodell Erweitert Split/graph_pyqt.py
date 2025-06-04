@@ -137,5 +137,5 @@ if __name__ == "__main__":
             q.put(("rating", vid, current_time, rating))
         current_time += 1
         time.sleep(0.1)
-
+#TEST
     graph_process_pyqt(q)
